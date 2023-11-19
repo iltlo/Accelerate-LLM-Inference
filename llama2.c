@@ -55,11 +55,8 @@ int Row;
 // thread function declaration
 void *thr_func(void *arg);
 
-// TODO:
-// Creates n threads; each with a unique ID (i.e., 0 to n-1)
-// Initializes necessary variables
 int create_mat_vec_mul(int thr_count) {
-    thread_count = thr_count;
+    thread_count = thr_count;       // Assume thr_count is >= 1
     
     // init mainMutex
     if (sem_init(&mainMutex, 0, 0) == -1) {
