@@ -1,19 +1,3 @@
-/*
-PLEASE WRITE DOWN NAME AND UID BELOW BEFORE SUBMISSION
-* NAME:
-* UID :
-
-Please download the model and tokenizer to the same folder:
-$ wget -O model.bin https://huggingface.co/huangs0/llama2.c/resolve/main/model.bin
-$ wget -O tokenizer.bin https://huggingface.co/huangs0/llama2.c/resolve/main/tokenizer.bin
-
-In compile, remember to add `-pthred` to link library:
-$ gcc -o template template.c utilities.c -O2 -pthread -lm
-
-Then Run with:
-$ ./parallel
-*/
-
 #define _GNU_SOURCE // keep this line
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,28 +23,193 @@ $ ./parallel
 // YOUR CODE STARTS HERE
 
 // additional header file
+#include <stdint.h>
+#include <pthread.h>
+#include <semaphore.h>
 
-// global variables
+// Structs
+typedef struct {
+    int start;
+    int end;
+} Range;
+
 struct rusage main_usage;        // get usage for main thread
 
+// Global variables for thread
+int thread_count;
 
-int init_mat_vec_mul(int thr_count) {
+pthread_t* threads;  // Dynamic array to hold threads
+sem_t mainMutex;     // to let the main thread wait for all the subthreads to finish
+sem_t* workerMutexs;
+Range** rangeArr;   // to hold thread arguments
+
+int terminate = 0;  // to indicate the threads to terminate
+
+// global variables for matrix vector multiplication
+float* Out;
+float* Vec;
+float* Mat;
+int Col;
+int Row;
+
+// thread function declaration
+void *thr_func(void *arg);
+
+// TODO:
+// Creates n threads; each with a unique ID (i.e., 0 to n-1)
+// Initializes necessary variables
+int create_mat_vec_mul(int thr_count) {
+    thread_count = thr_count;
     
-}
+    // init mainMutex
+    if (sem_init(&mainMutex, 0, 0) == -1) {
+        printf("Error: mainMutex sem_init failed\n");
+        return -1;
+    }
 
+    // init all worker thread semaphores
+    workerMutexs = (sem_t*) malloc(thr_count * sizeof(sem_t));
+    for (int i = 0; i < thr_count; i++) {
+        if (sem_init(&workerMutexs[i], 0, 0) == -1) {
+            printf("Error: workerMutexs sem_init failed\n");
+            return -1;
+        }
+    }
+
+    // init all threads
+    threads = (pthread_t*)malloc(thread_count * sizeof(pthread_t));
+    for (int i = 0; i < thread_count; i++) {
+        // create thread
+        if (pthread_create(&threads[i], NULL, thr_func, (void*)(intptr_t)i) != 0) {
+            printf("Error: pthread_create failed\n");
+            return -1;
+        }
+    }
+
+    // init the rangeArr
+    rangeArr = (Range**) malloc(thread_count * sizeof(Range*));
+    if (rangeArr == NULL) {
+        printf("Error allocating memory for array\n");
+        return -11;
+    }
+    // Initialize each array entry
+    for (int i = 0; i < thread_count; i++) {
+        // Allocate memory for the (start, end) pair
+        rangeArr[i] = (Range*) malloc(sizeof(Range));
+        if (rangeArr[i] == NULL) {
+            printf("Error allocating memory for entry %d\n", i);
+            return -1;
+        }
+    }
+}
 
 void mat_vec_mul(float* out, float* vec, float* mat, int col, int row) {
-    
+    //  in the case of a Matrix with d rows and n threads:
+    //  if d is divisible by n, the k-th thread (k = 0 , 1 , ... , n − 1) will handle the rows from [k * d / n] to [(k + 1) * d / n - 1] .
+    //  If is not divisible by n, we can assign first n − 1 threads (k = 0 , 1 , … , n − 2 ) with ceil(d / n) rows, while the last thread handles remaining rows.
+    int start_row = 0;
+    int end_row = 0;
+
+    if (row % thread_count != 0) {   // row is not divisible by thread_count
+        int rows_per_thread = row / thread_count + (row % thread_count != 0); // ceil(row / thread_count)
+        // first n-1 threads
+        for (int k = 0; k < thread_count - 1; k++) {
+            start_row = k * rows_per_thread;
+            end_row = (k + 1) * rows_per_thread - 1;
+            // assign the parameters to the threads
+            rangeArr[k]->start = start_row;
+            rangeArr[k]->end = end_row;
+        }
+        // last thread: thread id: thread_count - 1
+        start_row = (thread_count - 1) * rows_per_thread;
+        end_row = row - 1;
+        // assign the parameters to the threads
+        rangeArr[thread_count - 1]->start = start_row;
+        rangeArr[thread_count - 1]->end = end_row;
+
+    } else {        // row is divisible by thread_count
+        for (int k = 0; k < thread_count; k++) {
+            start_row = k * row / thread_count;
+            end_row = (k + 1) * row / thread_count - 1;
+            // assign the parameters to the threads
+            rangeArr[k]->start = start_row;
+            rangeArr[k]->end = end_row;
+        }
+    }
+    // assign all the corresponding global variables
+    Out = out;
+    Vec = vec;
+    Mat = mat;
+    Col = col;
+    Row = row;
+
+    // sem wait all subthread semaphores (when subthreads finish, they will post their semaphores)
+    for (int i = 0; i < thread_count; i++) {
+        sem_post(&workerMutexs[i]);
+    }
+
+    // wait for all the subthreads to finish
+    for (int i = 0; i < thread_count; i++) {
+        sem_wait(&mainMutex);
+    }
 }
 
 
-int close_mat_vec_mul() {
-    
+int destroy_mat_vec_mul() {
+    // print out self usage information for main thread
+    getrusage(RUSAGE_SELF, &main_usage);
+    printf("main thread - user: %.4f s, system: %.4f s\n",
+    (main_usage.ru_utime.tv_sec + main_usage.ru_utime.tv_usec/1000000.0),
+    (main_usage.ru_stime.tv_sec + main_usage.ru_stime.tv_usec/1000000.0));
+    // print out usage info for worker threads
+    terminate = 1; // to indicate the threads to terminate
+    for (int i = 0; i < thread_count; i++) {
+        sem_post(&workerMutexs[i]);        // wake up and inform threads to terminate
+    }
+
+    for (int i = 0; i < thread_count; i++) {
+        pthread_join(threads[i], NULL);   // wait for all threads
+    }
+
+    // free all the memory allocated
+    for (int i = 0; i < thread_count; i++) {
+        sem_destroy(&workerMutexs[i]);
+    }
+    sem_destroy(&mainMutex);
+    free(workerMutexs);
+    free(threads);
 }
 
 
 void *thr_func(void *arg) {
-    
+    struct rusage thread_usage;
+    // Obtain the thread's ID
+    intptr_t threadID = (intptr_t)arg;
+
+    while (1) {
+        sem_wait(&workerMutexs[threadID]);      // Wait for main thread's wake-up signal
+
+        if (terminate == 1) {
+            getrusage(RUSAGE_SELF, &main_usage);
+            printf("Thread %ld has completed - user: %.4f s, system: %.4f s\n",
+            threadID,
+            (main_usage.ru_utime.tv_sec + main_usage.ru_utime.tv_usec/1000000.0),
+            (main_usage.ru_stime.tv_sec + main_usage.ru_stime.tv_usec/1000000.0));
+            pthread_exit(NULL);
+        } else {
+            int start_row = rangeArr[threadID]->start;
+            int end_row = rangeArr[threadID]->end;
+            // W (d,n) @ x (n,) -> xout (d,)
+            for (int i = start_row; i <= end_row; i++) {
+                float val = 0.0f;
+                for (int j = 0; j < Col; j++) {
+                    val += Mat[i * Col + j] * Vec[j];
+                }
+                Out[i] = val;
+            }
+            sem_post(&mainMutex);   // wake up the main thread
+        }
+    }
 }
 
 
@@ -151,7 +300,7 @@ int main(int argc, char* argv[]) {
 
     // Initialize
     srand(seed);
-    init_mat_vec_mul(thr_count);
+    create_mat_vec_mul(thr_count);
 
     // load model
     LLMConfig config;
@@ -186,7 +335,7 @@ int main(int argc, char* argv[]) {
     printf("\n\nlength: %d, time: %f s, achieved tok/s: %f\n", config.seq_len, (double)(end-start)/1000, config.seq_len / (double)(end-start)*1000);
 
     // cleanup
-    close_mat_vec_mul();
+    destroy_mat_vec_mul();
     free_LLMRuntime(&state);
     free_LLMWeight(&weights);
     for (int i = 0; i < config.vocab_size; i++) { free(vocab[i]); }
